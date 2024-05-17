@@ -349,6 +349,34 @@ def check_token(tokens: List[Token], index: int, *types: _TC) -> bool:
     return result
 
 
+def check_non_whitespace(tokens: List[Token], index: int, *types: _TC) -> bool:
+    """
+    TODO EXPLAIN
+
+    :param tokens:
+    :param index:
+    :param types:
+
+    :return:
+    """
+
+    result = False
+
+    tokens = [t for t in tokens if not (match(t, Whitespace) or match(t, Newline))]
+    try:
+        token = tokens[index]
+    except IndexError:
+        pass
+    else:
+        for type_spec in types:
+            type_code, token_body = normalize_spec(type_spec)
+            if match(token, type_code, body=token_body):
+                result = True
+                break
+
+    return result
+
+
 def trim(tokens: List[Token]) -> List[Token]:
     """
     Alters the input-list by removing any whitespace-tokens from its ends.
@@ -382,23 +410,45 @@ def parse_selection(tokens: List[Token]) -> Selection:
 
     # Resolve the column-name from the final token: it really ought ot be either an identifier or a string-literal
     name_token = tokens[-1]
-    if match(name_token, Name):
+    if match(name_token, Name) or match(name_token, Name.Builtin) or match(name_token, Keyword):
         name = str(name_token)
-    elif match(name_token, String) or match(name_token, String.Single):
+    elif match(name_token, String) or match(name_token, String.Single) or match(name_token, String.Symbol):
         name = str(name_token)[1:-1]
     else:
-        raise ValueError(f"Expecting a name to conclude the selection, but got token {name_token}")
+        raise ValueError(f"Expecting a name to conclude the selection, but got token {repr(name_token)}")
 
     # If there's only one token, it's both the expression and the column-name
     if len(tokens) == 1:
         expression_tokens = tokens
-    # Otherwise, there's a distinct name which doesn't participate in the column's formula
+    # Otherwise, there's multiple tokens participating in this selection
     else:
-        # Get the sequence of tokens which doesn't include the column-name (then remove any "AS" which might be there)
-        expression_tokens = trim(tokens[:-1])
-        if check_token(expression_tokens, -1, (Keyword, "AS")):
-            expression_tokens = trim(expression_tokens[:-1])
+        # We have to determine whether these multiple tokens represent an expression with an implicit column name, or
+        # instead whether the column-name is explicit: an alias applied following the expression; we know there's an
+        # alias if the second-to-last token is the keyword "AS"
+        if check_non_whitespace(tokens, -2, (Keyword, "AS")):
+            expression_tokens = \
+                trim(trim(tokens[:-1])[:-1])  # trim the last non-whitespace, and the last non-whitespace after that
+        # Otherwise, there wasn't an "AS"; let's still treat it as an explicit alias if we find a string
+        elif check_token(tokens, -1, String, String.Single, String.Symbol):
+            expression_tokens = trim(tokens[:-1])
 
+        # Otherwise, there's neither an "AS" nor even a string on the end; the only way this expression has an explicit
+        # alias is if there's an identifier following the expression... we'll know that the identifier isn't part of the
+        # expression if it doesn't have a period in front of it
+        elif check_token(tokens, -1, Name, Name.Builtin, Keyword) and not check_non_whitespace(tokens, -2, (Punctuation, ".")):
+            expression_tokens = trim(trim(tokens[:-1])[:-1])
+
+        # Otherwise, there's no tokens to trim: the whole thing is the expression
+        else:
+            expression_tokens = tokens
+
+    trim(expression_tokens)
+    if check_token(expression_tokens, -1, Punctuation) and not check_token(expression_tokens, -1, (Punctuation, ")")):
+        raise \
+            ValueError(
+                f"SQL expression not expected to conclude in punctuation, but final token of {repr(name)} field found "
+                f"to be punctuation {repr(str(expression_tokens[-1]))}"
+            )
     result = Selection(name, expression_tokens)
     return result
 
@@ -467,20 +517,32 @@ def parse_outputs(source: str) -> Dict[str, str]:
 
 
 def main():
-    # Read the string containing our SQL
-    with open("sample.sql") as infile:
-        source = infile.read()
+    output_formulae_by_name_by_query = {}  # type: Dict[str, Dict[str, str]]
+    import json
+    with open("response_1715950277130.json") as infile:
+        query_configs = json.load(infile)
+    total = len(query_configs)
+    successes = 0
+    for query_config in query_configs:
+        query_name = query_config["queryName"]      # type: str
+        source = query_config["querySQLStream"]     # type: str
+        try:
+            # Parse the source to get our COLUMN->FORMULA pairs
+            output_formulae_by_name = parse_outputs(source)
+        except Exception as error:
+            print(f"Error parsing query {repr(query_name)}: ({type(error).__name__}) {error}")
+        else:
+            output_formulae_by_name_by_query[query_name] = output_formulae_by_name
+            for output_name, formula in output_formulae_by_name.items():
+                expression = f"{output_name.rjust(30)} | {formula}"
+                #outfile.write(expression + '\n')
+                print(expression)
 
-    # Parse the source to get our COLUMN->FORMULA pairs
-    output_formulae_by_name = parse_outputs(source)
+            successes += 1
 
-    # Print the pairs to the screen and to a file
-    with open("outfile.txt", "w") as outfile:
-        for output_name, formula in output_formulae_by_name.items():
-            expression = f"{output_name.rjust(30)} | {formula}"
-            outfile.write(expression + '\n')
-            print(expression)
+    print(f"Successfully parsed {successes} of {total} queries")
 
 
 if __name__ == "__main__":
     main()
+    # TODO: overhaul token comparison
